@@ -15,7 +15,10 @@ package kafka
 
 import (
 	"context"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/dapr/kit/logger"
 
@@ -35,7 +38,7 @@ type Binding struct {
 	logger       logger.Logger
 }
 
-// NewKafka returns a new kafka pubsub instance.
+// NewKafka returns a new kafka binding instance.
 func NewKafka(logger logger.Logger) *Binding {
 	k := kafka.NewKafka(logger)
 	// in kafka binding component, disable consumer retry by default
@@ -69,35 +72,51 @@ func (b *Binding) Operations() []bindings.OperationKind {
 	return []bindings.OperationKind{bindings.CreateOperation}
 }
 
+func (p *Binding) Close() (err error) {
+	return p.kafka.Close()
+}
+
 func (b *Binding) Invoke(_ context.Context, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
 	err := b.kafka.Publish(b.publishTopic, req.Data, req.Metadata)
 	return nil, err
 }
 
-func (b *Binding) Read(handler func(context.Context, *bindings.ReadResponse) ([]byte, error)) error {
+func (b *Binding) Read(handler bindings.Handler) error {
 	if len(b.topics) == 0 {
 		b.logger.Warnf("kafka binding: no topic defined, input bindings will not be started")
 		return nil
 	}
 
-	err := b.kafka.Subscribe(b.topics, map[string]string{}, newBindingAdapter(handler).adapter)
-	return err
+	ah := adaptHandler(handler)
+	for _, t := range b.topics {
+		b.kafka.AddTopicHandler(t, ah)
+	}
+
+	// Subscribe, in a background goroutine
+	err := b.kafka.Subscribe(context.Background())
+	if err != nil {
+		return err
+	}
+
+	// Wait until we exit
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh,
+		syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGQUIT)
+	<-sigCh
+
+	return nil
 }
 
-// bindingAdapter is used to adapter bindings handler to kafka.EventHandler with the same content.
-type bindingAdapter struct {
-	handler func(context.Context, *bindings.ReadResponse) ([]byte, error)
-}
-
-func newBindingAdapter(handler func(context.Context, *bindings.ReadResponse) ([]byte, error)) *bindingAdapter {
-	return &bindingAdapter{handler: handler}
-}
-
-func (a *bindingAdapter) adapter(ctx context.Context, event *kafka.NewEvent) error {
-	_, err := a.handler(ctx, &bindings.ReadResponse{
-		Data:        event.Data,
-		Metadata:    event.Metadata,
-		ContentType: event.ContentType,
-	})
-	return err
+func adaptHandler(handler bindings.Handler) kafka.EventHandler {
+	return func(ctx context.Context, event *kafka.NewEvent) error {
+		_, err := handler(ctx, &bindings.ReadResponse{
+			Data:        event.Data,
+			Metadata:    event.Metadata,
+			ContentType: event.ContentType,
+		})
+		return err
+	}
 }
